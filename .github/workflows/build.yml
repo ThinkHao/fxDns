@@ -1,0 +1,90 @@
+name: 构建与发布
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: 构建
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, windows]
+        goarch: [amd64, arm64]
+        exclude:
+          - goos: windows
+            goarch: arm64
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v3
+
+      - name: 设置 Go 环境
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.20'
+          cache: true
+
+      - name: 获取依赖
+        run: go mod download
+
+      - name: 构建
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          OUTPUT="fxdns"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            OUTPUT="fxdns.exe"
+          fi
+          mkdir -p dist
+          go build -v -o "dist/${OUTPUT}" ./cmd/fxdns
+
+      - name: 准备打包文件
+        run: |
+          mkdir -p release
+          cp dist/* release/
+          cp config/config.yaml release/config.example.yaml
+          cp README.md release/ || echo "README.md 不存在"
+          cp LICENSE release/ || echo "LICENSE 不存在"
+
+      - name: 打包
+        run: |
+          cd release
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip -r "../fxdns-${{ matrix.goos }}-${{ matrix.goarch }}.zip" .
+          else
+            tar -czvf "../fxdns-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz" .
+          fi
+          cd ..
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v3
+        with:
+          name: fxdns-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            fxdns-${{ matrix.goos }}-${{ matrix.goarch }}.*
+
+  release:
+    name: 发布
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v3
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@v3
+
+      - name: 创建发布
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            fxdns-*/*.zip
+            fxdns-*/*.tar.gz
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
