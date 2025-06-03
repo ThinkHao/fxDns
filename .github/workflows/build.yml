@@ -64,8 +64,7 @@ jobs:
         uses: actions/upload-artifact@v3
         with:
           name: fxdns-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: |
-            fxdns-${{ matrix.goos }}-${{ matrix.goarch }}.*
+          path: fxdns-${{ matrix.goos }}-${{ matrix.goarch }}.*
 
   release:
     name: 发布
@@ -77,13 +76,15 @@ jobs:
 
       - name: 下载构建产物
         uses: actions/download-artifact@v3
+        with:
+          path: artifacts
 
       - name: 创建发布
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            fxdns-*/*.zip
-            fxdns-*/*.tar.gz
+            artifacts/fxdns-*/*.zip
+            artifacts/fxdns-*/*.tar.gz
           draft: false
           prerelease: false
         env:
