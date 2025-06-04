@@ -61,7 +61,7 @@ jobs:
           cd ..
 
       - name: 上传构建产物
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: fxdns-${{ matrix.goos }}-${{ matrix.goarch }}
           path: fxdns-${{ matrix.goos }}-${{ matrix.goarch }}.*
@@ -75,7 +75,7 @@ jobs:
         uses: actions/checkout@v3
 
       - name: 下载构建产物
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
 
