@@ -40,7 +40,11 @@ jobs:
             OUTPUT="fxdns.exe"
           fi
           mkdir -p dist
-          go build -v -o "dist/${OUTPUT}" ./cmd/fxdns
+          if [ "${{ matrix.goos }}" = "linux" ]; then
+            CGO_ENABLED=0 go build -v -o "dist/${OUTPUT}" ./cmd/fxdns
+          else
+            go build -v -o "dist/${OUTPUT}" ./cmd/fxdns
+          fi
 
       - name: 准备打包文件
         run: |
