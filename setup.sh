@@ -119,7 +119,7 @@ apply_setcap() {
     if ! command -v setcap >/dev/null; then
         msg_warning "'setcap' 命令未找到。无法授予绑定特权端口的能力。"
         msg_warning "请安装 'libcap2-bin' (Debian/Ubuntu) 或 'libcap' (RHEL/CentOS) 包。"
-        msg_warning "程序可能无法在标准 DNS 端口 (如 53) 上监听。"
+        msg_warning "程序可能无法在标准 DNS 端口，例如 53 端口，上监听。"
         return 1 # Indicate failure or inability to perform
     fi
     msg_info "授予 '${BIN_PATH}' CAP_NET_BIND_SERVICE 能力..."
@@ -166,7 +166,7 @@ install_initd_service() {
 }
 
 do_install() {
-    msg_info "开始安装 ${APP_NAME}...
+    msg_info "开始安装 ${APP_NAME}..."
     check_root
     detect_init_system
 
@@ -175,7 +175,7 @@ do_install() {
     copy_files
     
     if ! apply_setcap; then
-        msg_warning "Setcap 未成功应用。如果配置监听特权端口 (如 53)，服务可能无法启动。"
+        msg_warning "Setcap 未成功应用。如果配置监听特权端口，例如 53 端口，服务可能无法启动。"
     fi
 
     if [ "${INIT_SYSTEM}" == "systemd" ]; then
@@ -190,7 +190,7 @@ do_install() {
 }
 
 do_update() {
-    msg_info "开始更新 ${APP_NAME}...
+    msg_info "开始更新 ${APP_NAME}..."
     check_root
     detect_init_system
 
@@ -231,7 +231,7 @@ do_update() {
 }
 
 do_uninstall() {
-    msg_info "开始卸载 ${APP_NAME}...
+    msg_info "开始卸载 ${APP_NAME}..."
     check_root
     detect_init_system
 
