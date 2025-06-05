@@ -50,7 +50,17 @@ jobs:
         run: |
           mkdir -p release
           cp dist/* release/
-          cp config/config.yaml release/config.example.yaml
+          cp config/config.yaml release/config.example.yaml # 请确保这是正确的源配置文件路径
+          # 如果 setup.sh 在项目根目录
+          if [ "${{ matrix.goos }}" = "linux" ]; then
+            if [ -f ./setup.sh ]; then
+              cp ./setup.sh release/
+              chmod +x release/setup.sh
+              echo "setup.sh 已添加到 Linux 包中"
+            else
+              echo "警告: setup.sh 未在项目根目录找到，Linux 包将不包含安装脚本。"
+            fi
+          fi
           cp README.md release/ || echo "README.md 不存在"
           cp LICENSE release/ || echo "LICENSE 不存在"
 

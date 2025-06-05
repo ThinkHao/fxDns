@@ -2,15 +2,12 @@ package config
 
 import (
 	"io/ioutil"
-	"log"
 	"net"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"gopkg.in/yaml.v3"
 )
 
@@ -55,10 +52,6 @@ const (
 )
 
 // 全局配置实例
-var (
-	globalConfig *Config
-	configMutex  sync.RWMutex
-)
 
 // LoadConfig 从文件加载配置
 func LoadConfig(configPath string) (*Config, error) {
@@ -168,58 +161,4 @@ func MatchDomain(pattern, domain string) bool {
 	}
 	
 	return false
-}
-
-// GetGlobalConfig 获取全局配置
-func GetGlobalConfig() *Config {
-	configMutex.RLock()
-	defer configMutex.RUnlock()
-	return globalConfig
-}
-
-// SetGlobalConfig 设置全局配置
-func SetGlobalConfig(cfg *Config) {
-	configMutex.Lock()
-	defer configMutex.Unlock()
-	globalConfig = cfg
-}
-
-// WatchConfig 监视配置文件变化并自动重新加载
-func WatchConfig(configPath string) error {
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return err
-	}
-
-	go func() {
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				if event.Op&fsnotify.Write == fsnotify.Write {
-					log.Printf("检测到配置文件变化: %s", event.Name)
-					// 配置文件已修改，重新加载
-					cfg, err := LoadConfig(configPath)
-					if err == nil {
-						log.Printf("重新加载配置成功")
-						SetGlobalConfig(cfg)
-					} else {
-						log.Printf("重新加载配置失败: %v", err)
-					}
-				}
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				log.Printf("配置文件监控错误: %v", err)
-			}
-		}
-	}()
-
-	// 监视配置文件目录
-	dirPath := filepath.Dir(configPath)
-	log.Printf("开始监控配置文件目录: %s", dirPath)
-	return watcher.Add(dirPath)
 }

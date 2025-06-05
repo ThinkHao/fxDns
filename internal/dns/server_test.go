@@ -92,7 +92,7 @@ func TestProcessResponse(t *testing.T) {
 		})
 
 		// 处理响应
-		processedResp := server.processResponse(req, resp)
+		processedResp := server.processResponse(req, resp, []net.IP{net.ParseIP("192.168.1.100")})
 
 		// 验证结果
 		if len(processedResp.Answer) != 1 {
@@ -125,7 +125,7 @@ func TestProcessResponse(t *testing.T) {
 		})
 
 		// 处理响应
-		processedResp := server.processResponse(req, resp)
+		processedResp := server.processResponse(req, resp, nil)
 
 		// 验证结果应该与原始响应相同
 		if len(processedResp.Answer) != len(resp.Answer) {
@@ -158,7 +158,7 @@ func TestProcessResponse(t *testing.T) {
 		})
 
 		// 处理响应
-		processedResp := server.processResponse(req, resp)
+		processedResp := server.processResponse(req, resp, []net.IP{net.ParseIP("192.168.1.100")})
 
 		// 验证结果
 		if len(processedResp.Answer) != 2 {

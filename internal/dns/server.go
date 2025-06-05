@@ -1,6 +1,7 @@
 package dns
 
 import (
+	// "errors" // 移除未使用的 errors 包
 	"log"
 	"net"
 	"strings"
@@ -11,6 +12,8 @@ import (
 	"github.com/hao/fxdns/internal/util"
 	"github.com/miekg/dns"
 )
+
+const fallbackUpstream = "114.114.114.114:53"
 
 // Server 表示 DNS 代理服务器
 type Server struct {
@@ -24,6 +27,8 @@ type Server struct {
 	cidrMatcher   *util.CIDRMatcher
 	domainMatcher *util.DomainMatcher
 	configManager *config.ConfigManager
+	mu            sync.RWMutex // 添加互斥锁
+	shutdownChan  chan struct{} // 用于通知 ListenAndServe 协程停止
 }
 
 // Cache 表示 DNS 缓存
@@ -93,66 +98,179 @@ func NewServer(configPath string) (*Server, error) {
 	// 注册配置变更监听器
 	configManager.AddListener(server)
 
+	server.shutdownChan = make(chan struct{}) // 初始化 shutdownChan
 	return server, nil
 }
 
-// Start 启动 DNS 代理服务器
+// Start 启动 DNS 代理服务器并开始配置监控
 func (s *Server) Start() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	// 启动配置监控
 	if err := s.configManager.StartWatching(); err != nil {
+		log.Printf("DNS Server: 启动配置监控失败: %v", err)
 		return err
 	}
 
-	dns.HandleFunc(".", s.handleDNSRequest)
+	// 初始化并启动 miekg/dns 服务器
+	return s.startDNSServerProcess()
+}
 
-	s.server = &dns.Server{
-		Addr:    s.config.Server.Listen,
-		Net:     "udp",
-		Handler: dns.DefaultServeMux,
+// startDNSServerProcess 负责实际创建和启动 miekg/dns 服务器实例。
+// 调用此方法时，调用者应持有 s.mu 的锁。
+func (s *Server) startDNSServerProcess() error {
+	cfg := s.config // 使用当前 Server 持有的配置
+
+	// 如果已经有一个服务器在运行，先尝试关闭它 (理论上 Start 时不应该有)
+	if s.server != nil {
+		log.Println("DNS Server: 检测到已有服务器实例，将先关闭它...")
+		if err := s.server.Shutdown(); err != nil {
+			log.Printf("DNS Server: 关闭旧服务器实例失败: %v", err)
+			// 继续尝试启动新的，但记录错误
+		}
+		s.server = nil
 	}
 
-	log.Printf("DNS 代理服务器启动在 %s", s.config.Server.Listen)
-	return s.server.ListenAndServe()
+	// TODO: 未来可以从 cfg.Server.Network 读取网络类型，如果该字段被添加
+	// 目前 config.ServerConfig 中没有 Network 字段，所以默认使用 "udp"
+	network := "udp" 
+
+	dnsServer := &dns.Server{
+		Addr:    cfg.Server.Listen,
+		Net:     network, // 使用确定的 network 类型
+		Handler: s, // Server 类型实现了 ServeDNS 方法
+		NotifyStartedFunc: func() {
+			log.Printf("DNS Server: 已成功在 %s (%s) 启动监听", cfg.Server.Listen, network)
+		},
+		// ShutdownTimeout: 5 * time.Second, // 移除：miekg/dns.Server 没有此字段
+	}
+	s.server = dnsServer
+
+	// 在新的 goroutine 中启动服务器，以便 Start 可以返回
+	go func() {
+		log.Printf("DNS Server: 尝试在 %s (%s) 启动 miekg/dns 服务器...", cfg.Server.Listen, network)
+		if err := s.server.ListenAndServe(); err != nil {
+			// 检查是否是因为我们主动关闭导致的错误
+			select {
+			case <-s.shutdownChan:
+				log.Printf("DNS Server: ListenAndServe 在 %s (%s) 正常关闭。", cfg.Server.Listen, network)
+			default:
+				log.Printf("DNS Server: ListenAndServe 在 %s (%s) 失败: %v", cfg.Server.Listen, network, err)
+				// 这里可以考虑如何通知主程序启动失败，例如通过一个 channel
+			}
+		}
+	}()
+
+	return nil // Start() 本身返回 nil，表示启动过程已开始
 }
 
 // Stop 停止 DNS 代理服务器
 func (s *Server) Stop() error {
-	if s.server != nil {
-		return s.server.Shutdown()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	log.Println("DNS Server: 开始停止服务...")
+
+	// 停止配置文件监控
+	if s.configManager != nil {
+		log.Println("DNS Server: 正在停止配置监控...")
+		s.configManager.StopWatching()
+		log.Println("DNS Server: 配置监控已停止。")
 	}
+
+	// 关闭底层的 miekg/dns 服务器
+	if s.server != nil {
+		log.Println("DNS Server: 正在关闭 miekg/dns 服务器...")
+		// 通知 ListenAndServe 协程我们是主动关闭
+		// 检查 channel 是否已经关闭，避免重复关闭
+		select {
+		case <-s.shutdownChan:
+			// Channel 已经关闭
+		default:
+			close(s.shutdownChan)
+		}
+
+		if err := s.server.Shutdown(); err != nil {
+			log.Printf("DNS Server: 关闭 miekg/dns 服务器失败: %v", err)
+			// 即使 shutdown 失败，也继续标记服务已停止
+		} else {
+			log.Println("DNS Server: miekg/dns 服务器已成功关闭。")
+		}
+		s.server = nil
+	} else {
+		log.Println("DNS Server: miekg/dns 服务器未运行或已停止。")
+	}
+
+	log.Println("DNS Server: 服务已成功停止。")
 	return nil
 }
 
-// handleDNSRequest 处理 DNS 请求
-func (s *Server) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
+// ServeDNS 实现 dns.Handler 接口，处理 DNS 请求
+func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	// 获取工作池令牌
 	<-s.workerPool
 	defer func() {
 		s.workerPool <- struct{}{}
 	}()
 
-	// 检查缓存
-	if resp := s.checkCache(r); resp != nil {
-		w.WriteMsg(resp)
+	// 1. 检查缓存
+	if cachedResp := s.checkCache(r); cachedResp != nil {
+		log.Printf("缓存命中: %s", r.Question[0].Name)
+		w.WriteMsg(cachedResp)
 		return
 	}
+	log.Printf("缓存未命中: %s", r.Question[0].Name)
 
-	// 转发请求到上游 DNS 服务器
-	resp, err := s.forwardRequest(r)
+	// 2. 转发到主上游服务器 (s.upstream)
+	initialResp, _, err := s.client.Exchange(r, s.upstream)
 	if err != nil {
-		log.Printf("转发请求失败: %v", err)
+		log.Printf("转发请求到主上游 %s 失败: %v, 请求: %s", s.upstream, err, r.Question[0].Name)
 		dns.HandleFailed(w, r)
 		return
 	}
 
-	// 处理响应
-	processedResp := s.processResponse(r, resp)
+	// 3. 检查主上游响应的 CNAME 解析结果是否包含我司 CDN IP
+	//    checkCNAMEForCDNIP 会使用 s.upstream 解析 CNAME 记录
+	cdnIPsFound, cdnIPsList := s.checkCNAMEForCDNIP(initialResp)
 
-	// 更新缓存
-	s.updateCache(r, processedResp)
+	var finalResp *dns.Msg
 
-	// 发送响应
-	w.WriteMsg(processedResp)
+	if !cdnIPsFound {
+		// 4. 我司 CDN IP 未在主上游的 CNAME 解析结果中找到，则固定转发给 fallbackUpstream
+		questionName := ""
+		if len(r.Question) > 0 {
+			questionName = r.Question[0].Name
+		}
+		log.Printf("CDN IP 未在 %s (主上游) 的 CNAME 解析结果中找到。转发到 %s, 原始请求: %s", s.upstream, fallbackUpstream, questionName)
+		
+		var RTT time.Duration
+		finalResp, RTT, err = s.client.Exchange(r, fallbackUpstream)
+		if err != nil {
+			log.Printf("转发请求到 %s 失败: %v, 请求: %s", fallbackUpstream, err, questionName)
+			dns.HandleFailed(w, r)
+			return
+		}
+		log.Printf("从 %s 获取到响应, RTT: %v, 请求: %s", fallbackUpstream, RTT, questionName)
+		// 根据需求第四点：“返回其解析结果”，所以不对 finalResp 进行 further processing
+	} else {
+		// 5. 我司 CDN IP 在主上游的 CNAME 解析结果中找到。使用 processResponse 处理 initialResp
+		questionName := ""
+		if len(r.Question) > 0 {
+			questionName = r.Question[0].Name
+		}
+		log.Printf("CDN IP 在 %s (主上游) 的 CNAME 解析结果中找到。处理响应, 原始请求: %s", s.upstream, questionName)
+		finalResp = s.processResponse(r, initialResp, cdnIPsList) // 注意：传入 cdnIPsList
+	}
+
+	// 6. 更新缓存并发送响应
+	if finalResp != nil {
+		s.updateCache(r, finalResp)
+		w.WriteMsg(finalResp)
+	} else {
+		// Should not happen if logic is correct, but as a fallback
+		dns.HandleFailed(w, r)
+	}
 }
 
 // forwardRequest 将请求转发到上游 DNS 服务器
@@ -161,77 +279,60 @@ func (s *Server) forwardRequest(r *dns.Msg) (*dns.Msg, error) {
 	return resp, err
 }
 
-// processResponse 处理 DNS 响应
-func (s *Server) processResponse(req, resp *dns.Msg) *dns.Msg {
-	if len(req.Question) == 0 || resp == nil {
-		return resp
+// processResponse 处理 DNS 响应 (在已知我司 CDN IP 存在于原始解析路径中的情况下调用)
+func (s *Server) processResponse(req, originalResp *dns.Msg, cdnIPsFromInitialCheck []net.IP) *dns.Msg {
+	if len(req.Question) == 0 || originalResp == nil {
+		return originalResp
 	}
 
-	// 获取请求的域名
-	domain := normalizeDomain(req.Question[0].Name)
+	// cdnIPsFromInitialCheck 是从 handleDNSRequest 传入的，已确认包含我司 CDN IP
+	// 如果 cdnIPsFromInitialCheck 为空，则表示逻辑错误或 handleDNSRequest 调用不当
+	if len(cdnIPsFromInitialCheck) == 0 {
+		log.Printf("错误: processResponse 被调用，但 cdnIPsFromInitialCheck 为空。请求: %s", req.Question[0].Name)
+		return originalResp // 返回原始响应以避免进一步错误
+	}
 
-	// 检查域名是否匹配任何规则
-	if !s.domainMatcher.Match(domain) {
-		// 构建 CNAME 链，检查链中是否有匹配的域名
+	qName := req.Question[0].Name
+	domainForStrategy := normalizeDomain(qName)
+	strategy := s.config.GetDomainStrategy(domainForStrategy)
+
+	// 如果请求的域名本身没有特定策略 (Filter/ReturnA)，检查其 CNAME 链中是否有域名配置了此类策略
+	if strategy == config.StrategyNone { // If no specific strategy, or if strategy is explicitly 'none' (which implies forward)
 		chain := NewCNAMEChain()
-		chain.BuildFromResponse(resp)
-		
-		// 检查 CNAME 链中是否有匹配的域名
-		matchFound := false
+		chain.BuildFromResponse(originalResp) // originalResp 是来自主上游的响应
+
+		foundOverrideStrategyInChain := false
 		for domainInChain := range chain.domains {
-			if s.domainMatcher.Match(domainInChain) {
-				matchFound = true
-				log.Printf("在 CNAME 链中找到匹配的域名: %s", domainInChain)
-				break
+			if s.domainMatcher.Match(domainInChain) { // 确保是我们关心的域名模式
+				chainStrategy := s.config.GetDomainStrategy(domainInChain)
+				if chainStrategy == config.StrategyFilterNonCDN || chainStrategy == config.StrategyReturnCDNA {
+					strategy = chainStrategy
+					domainForStrategy = domainInChain // 更新应用策略的域名为 CNAME 链中的域名
+					log.Printf("策略应用于 CNAME 链中的域名 %s: %s (原始请求 %s)", domainForStrategy, strategy, qName)
+					foundOverrideStrategyInChain = true
+					break
+				}
 			}
 		}
-		
-		if !matchFound {
-			return resp // 没有匹配的域名，直接返回原始响应
+		// 如果遍历 CNAME 链后策略仍为 None 或 Forward，说明没有匹配到 Filter/ReturnA 策略
+		if !foundOverrideStrategyInChain && strategy == config.StrategyNone {
+			log.Printf("CDN IP 存在于 %s 的解析中，但域名 %s (或其 CNAME 链) 无特定过滤/返回A记录策略。返回原始上游响应。", qName, domainForStrategy)
+			return originalResp
 		}
 	}
 
-	// 获取域名的处理策略
-	strategy := s.config.GetDomainStrategy(domain)
-	if strategy == config.StrategyNone {
-		// 检查 CNAME 链中是否有匹配的域名及其策略
-		chain := NewCNAMEChain()
-		chain.BuildFromResponse(resp)
-		
-		for domainInChain := range chain.domains {
-			strategyInChain := s.config.GetDomainStrategy(domainInChain)
-			if strategyInChain != config.StrategyNone {
-				strategy = strategyInChain
-				log.Printf("使用 CNAME 链中域名 %s 的策略: %s", domainInChain, strategy)
-				break
-			}
-		}
-		
-		if strategy == config.StrategyNone {
-			return resp // 没有找到处理策略，直接返回原始响应
-		}
-	}
-
-	// 构建 CNAME 链并检查 CDN IP
-	chain := NewCNAMEChain()
-	chain.BuildFromResponse(resp)
-	cdnIPs := ExtractCDNIPs(resp, chain, s.cidrMatcher.Contains)
-	
-	if len(cdnIPs) == 0 {
-		log.Printf("未检测到 CDN IP，返回原始响应")
-		return resp
-	}
-
-	// 根据策略处理响应
+	// 根据最终确定的策略和从主上游获取的 cdnIPsFromInitialCheck 进行处理
 	switch strategy {
 	case config.StrategyFilterNonCDN:
-		log.Printf("使用策略: 过滤非 CDN IP，发现 %d 个 CDN IP", len(cdnIPs))
-		return s.filterNonCDNIPs(resp, cdnIPs)
+		log.Printf("域名 %s (策略针对 %s) 策略: %s。使用 %d 个CDN IP过滤非 CDN IP。原始请求: %s", qName, domainForStrategy, strategy, len(cdnIPsFromInitialCheck), qName)
+		return s.filterNonCDNIPs(originalResp, cdnIPsFromInitialCheck)
 	case config.StrategyReturnCDNA:
-		log.Printf("使用策略: 直接返回 CDN A 记录，发现 %d 个 CDN IP", len(cdnIPs))
-		return s.returnCDNARecords(req, cdnIPs)
+		log.Printf("域名 %s (策略针对 %s) 策略: %s。使用 %d 个CDN IP直接返回 CDN A 记录。原始请求: %s", qName, domainForStrategy, strategy, len(cdnIPsFromInitialCheck), qName)
+		return s.returnCDNARecords(req, cdnIPsFromInitialCheck)
 	default:
-		return resp
+		// 此路径理论上不应到达，因为 strategy 要么是 Filter/ReturnA，要么已在上一个if块中返回 originalResp
+		log.Printf("域名 %s (策略针对 %s) 未匹配任何处理策略 (%s)，但CDN IP存在。返回原始上游响应。原始请求: %s", qName, domainForStrategy, strategy, qName)
+		return originalResp
 	}
 }
 
@@ -452,32 +553,79 @@ func (s *Server) updateCache(req, resp *dns.Msg) {
 
 // OnConfigChange 实现 ConfigChangeListener 接口
 func (s *Server) OnConfigChange(oldConfig, newConfig *config.Config) {
-	log.Printf("配置已更新，正在应用新配置...")
-	
-	// 更新服务器配置
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	log.Println("DNS Server: 检测到配置变更，开始处理...")
+
+	// 检查监听地址或网络类型是否发生变化 (当前只检查 Listen)
+	// TODO: 如果未来 config.ServerConfig 支持 Network 字段，也需要检查 oldConfig.Server.Network vs newConfig.Server.Network
+	listenChanged := oldConfig.Server.Listen != newConfig.Server.Listen
+
+	// 更新核心配置指针总是需要的
 	s.config = newConfig
-	
-	// 更新 CIDR 匹配器
+
+	// 更新其他依赖配置的组件
+	s.client.Timeout = newConfig.Upstream.Timeout
+	s.upstream = newConfig.Upstream.Server
+	s.timeout = newConfig.Upstream.Timeout
+
 	s.cidrMatcher.Clear()
-	s.cidrMatcher.AddCIDRs(newConfig.CDNIPs)
-	
-	// 更新域名匹配器
+	if err := s.cidrMatcher.AddCIDRs(newConfig.CDNIPs); err != nil {
+		log.Printf("DNS Server: OnConfigChange 更新 CIDR 匹配器失败: %v", err)
+		// 根据策略，可能需要返回或标记服务为不稳定状态
+	}
+
 	s.domainMatcher.Clear()
 	for _, rule := range newConfig.Domains {
 		s.domainMatcher.AddPattern(rule.Pattern)
 	}
-	
-	// 更新客户端超时设置
-	s.client.Timeout = newConfig.Upstream.Timeout
-	s.upstream = newConfig.Upstream.Server
-	s.timeout = newConfig.Upstream.Timeout
-	
-	// 更新缓存设置
+
 	s.cache.mu.Lock()
 	s.cache.maxSize = newConfig.Server.CacheSize
 	s.cache.ttl = newConfig.Server.CacheTTL
 	s.cache.mu.Unlock()
-	
-	log.Printf("新配置已应用，CDN IP 数量: %d, 域名规则数量: %d", 
-		s.cidrMatcher.Count(), s.domainMatcher.Count())
+
+	log.Printf("DNS Server: 内部配置已更新。新监听地址: %s, 上游 DNS: %s, CDN IP 数量: %d, 域名规则数量: %d", 
+		newConfig.Server.Listen, newConfig.Upstream.Server, len(newConfig.CDNIPs), len(newConfig.Domains))
+
+	if listenChanged {
+		log.Printf("DNS Server: 监听到地址从 '%s' 变为 '%s'。准备重启 DNS 服务...", oldConfig.Server.Listen, newConfig.Server.Listen)
+
+		// 1. 关闭当前服务器 (如果正在运行)
+		if s.server != nil {
+			log.Println("DNS Server: OnConfigChange 正在关闭旧的 miekg/dns 服务器...")
+			// 通知旧的 ListenAndServe 协程我们是主动关闭
+			// 需要为新的服务器实例创建一个新的 shutdownChan
+			currentShutdownChan := s.shutdownChan
+			go func(sdChan chan struct{}) { // 在 goroutine 中关闭，避免阻塞 OnConfigChange
+				select {
+				case <-sdChan:
+				default:
+					close(sdChan)
+				}
+			}(currentShutdownChan)
+
+			if err := s.server.Shutdown(); err != nil {
+				log.Printf("DNS Server: OnConfigChange 关闭旧 miekg/dns 服务器失败: %v", err)
+			} else {
+				log.Println("DNS Server: OnConfigChange 旧 miekg/dns 服务器已关闭。")
+			}
+			s.server = nil
+		}
+
+		// 为新的服务器实例创建一个新的 shutdownChan
+		s.shutdownChan = make(chan struct{})
+
+		// 2. 使用新配置启动服务器 (startDNSServerProcess 内部会处理 s.server 的创建和 goroutine 启动)
+		log.Println("DNS Server: OnConfigChange 正在使用新配置启动 miekg/dns 服务器...")
+		if err := s.startDNSServerProcess(); err != nil {
+			log.Printf("DNS Server: OnConfigChange 启动新 miekg/dns 服务器失败: %v", err)
+			// 启动失败，可能需要一些错误处理逻辑，例如尝试恢复旧配置或标记服务为不健康
+		} else {
+			log.Println("DNS Server: OnConfigChange 新 miekg/dns 服务器启动流程已开始。")
+		}
+	} else {
+		log.Println("DNS Server: 监听地址未更改，无需重启服务。配置已动态应用。")
+	}
 }
