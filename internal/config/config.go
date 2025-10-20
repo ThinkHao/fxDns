@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"io/ioutil"
 	"net"
 	"regexp"
@@ -23,10 +24,29 @@ type Config struct {
 	mu          sync.RWMutex
 }
 
+// Validate 对配置进行基本校验
+func (c *Config) Validate() error {
+    // 验证上游 DNS 服务器配置
+    if strings.TrimSpace(c.Upstream.Server) == "" {
+        return fmt.Errorf("上游 DNS 服务器地址不能为空")
+    }
+    // 验证服务器工作协程数量
+    if c.Server.Workers <= 0 {
+        return fmt.Errorf("工作协程数量必须大于 0")
+    }
+    // 验证 CDN IP 列表
+    if len(c.CDNIPs) == 0 {
+        return fmt.Errorf("CDN IP 列表不能为空")
+    }
+    return nil
+}
+
 // UpstreamConfig 表示上游 DNS 服务器的配置
 type UpstreamConfig struct {
-	Server  string        `yaml:"server"`
-	Timeout time.Duration `yaml:"timeout"`
+	Server          string        `yaml:"server"`
+	FallbackServer  string        `yaml:"fallback_server"`
+	Timeout         time.Duration `yaml:"timeout"`
+	NoRecordNoFallback bool        `yaml:"no_record_no_fallback"`
 }
 
 // ServerConfig 表示 DNS 服务器的配置
@@ -39,9 +59,11 @@ type ServerConfig struct {
 
 // DomainRule 表示域名处理规则
 type DomainRule struct {
-	Pattern  string  `yaml:"pattern"`
-	Strategy string  `yaml:"strategy"`
-	TTL      uint32  `yaml:"ttl"`       // 返回给客户端的 TTL 值（秒）
+	Pattern               string  `yaml:"pattern"`
+	Strategy              string  `yaml:"strategy"`
+	TTL                   uint32  `yaml:"ttl"`       // 返回给客户端的 TTL 值（秒）
+	StripCNAMEWhenNoRecord bool    `yaml:"strip_cname_when_no_record"`
+	NoRecordNoFallback    *bool   `yaml:"no_record_no_fallback"`
 }
 
 // 策略常量
@@ -67,6 +89,11 @@ func LoadConfig(configPath string) (*Config, error) {
 
 	// 解析 CIDR
 	if err := cfg.parseCIDRs(); err != nil {
+		return nil, err
+	}
+
+	// 基本校验，确保与单测期望一致
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
