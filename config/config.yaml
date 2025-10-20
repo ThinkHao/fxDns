@@ -3,6 +3,10 @@
 # 上游 DNS 服务器配置
 upstream:
   server: "8.8.8.8:53"
+  # 可选：备用上游 DNS
+  fallback_server: "114.114.114.114:53"
+  # 可选：当主上游没有返回任何 A/AAAA 时，不做校验且不回退
+  no_record_no_fallback: false
   timeout: 5s
 
 # 服务配置
@@ -28,6 +32,8 @@ domains:
     ttl: 300  # 5分钟
   - pattern: "*.cdn.example.com"
     strategy: "return_cdn_a"    # 直接返回 CDN 节点 IP 的 A 记录
+    no_record_no_fallback: true   # 可选：此域名在无 A/AAAA 时不回退
+    strip_cname_when_no_record: true  # 可选：当无 A/AAAA 时剔除对应 CNAME
     ttl: 60   # 1分钟
   - pattern: "static.example.org"
     strategy: "filter_non_cdn"

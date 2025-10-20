@@ -13,7 +13,7 @@ import (
 	"github.com/miekg/dns"
 )
 
-const fallbackUpstream = "114.114.114.114:53"
+// 备用上游从配置读取，不再使用硬编码常量
 
 // Server 表示 DNS 代理服务器
 type Server struct {
@@ -230,6 +230,20 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
+	// 2.1 如果主上游没有返回任何 A/AAAA，根据域级覆盖或全局配置不回退且不做校验，直接返回主上游结果
+	if s.noAorAAAA(initialResp) && s.shouldNoRecordNoFallback(r.Question[0].Name) {
+		// 针对 return_cdn_a 且启用剔除的规则，移除对应 CNAME
+		if effStrategy, domainForStrategy := s.effectiveStrategyForNoRecord(r, initialResp); effStrategy == config.StrategyReturnCDNA && s.shouldStripCNAMEWhenNoRecord(domainForStrategy) {
+			cleaned := s.stripCNAMEsForDomain(initialResp, domainForStrategy)
+			s.updateCache(r, cleaned)
+			w.WriteMsg(cleaned)
+			return
+		}
+		s.updateCache(r, initialResp)
+		w.WriteMsg(initialResp)
+		return
+	}
+
 	// 3. 检查主上游响应的 CNAME 解析结果是否包含我司 CDN IP
 	//    checkCNAMEForCDNIP 会使用 s.upstream 解析 CNAME 记录
 	cdnIPsFound, cdnIPsList := s.checkCNAMEForCDNIP(initialResp)
@@ -242,16 +256,21 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		if len(r.Question) > 0 {
 			questionName = r.Question[0].Name
 		}
-		log.Printf("CDN IP 未在 %s (主上游) 的 CNAME 解析结果中找到。转发到 %s, 原始请求: %s", s.upstream, fallbackUpstream, questionName)
-		
-		var RTT time.Duration
-		finalResp, RTT, err = s.client.Exchange(r, fallbackUpstream)
-		if err != nil {
-			log.Printf("转发请求到 %s 失败: %v, 请求: %s", fallbackUpstream, err, questionName)
-			dns.HandleFailed(w, r)
-			return
+		fallback := strings.TrimSpace(s.config.Upstream.FallbackServer)
+		if fallback == "" {
+			log.Printf("CDN IP 未在 %s 的 CNAME 解析结果中找到，且未配置备用上游。直接返回主上游响应。请求: %s", s.upstream, questionName)
+			finalResp = initialResp
+		} else {
+			log.Printf("CDN IP 未在 %s (主上游) 的 CNAME 解析结果中找到。转发到 %s, 原始请求: %s", s.upstream, fallback, questionName)
+			var RTT time.Duration
+			finalResp, RTT, err = s.client.Exchange(r, fallback)
+			if err != nil {
+				log.Printf("转发请求到 %s 失败: %v, 请求: %s", fallback, err, questionName)
+				dns.HandleFailed(w, r)
+				return
+			}
+			log.Printf("从 %s 获取到响应, RTT: %v, 请求: %s", fallback, RTT, questionName)
 		}
-		log.Printf("从 %s 获取到响应, RTT: %v, 请求: %s", fallbackUpstream, RTT, questionName)
 		// 根据需求第四点：“返回其解析结果”，所以不对 finalResp 进行 further processing
 	} else {
 		// 5. 我司 CDN IP 在主上游的 CNAME 解析结果中找到。使用 processResponse 处理 initialResp
@@ -314,10 +333,11 @@ func (s *Server) processResponse(req, originalResp *dns.Msg, cdnIPsFromInitialCh
 				}
 			}
 		}
-		// 如果遍历 CNAME 链后策略仍为 None 或 Forward，说明没有匹配到 Filter/ReturnA 策略
+		// 如果遍历 CNAME 链后策略仍为 None，说明没有匹配到 Filter/ReturnA 策略
+		// 根据单测期望：当检测到 CDN IP 时，默认执行过滤非CDN逻辑
 		if !foundOverrideStrategyInChain && strategy == config.StrategyNone {
-			log.Printf("CDN IP 存在于 %s 的解析中，但域名 %s (或其 CNAME 链) 无特定过滤/返回A记录策略。返回原始上游响应。", qName, domainForStrategy)
-			return originalResp
+			log.Printf("CDN IP 存在于 %s 的解析中，但域名 %s (或其 CNAME 链) 无特定策略。默认过滤非CDN IP。", qName, domainForStrategy)
+			return s.filterNonCDNIPs(originalResp, cdnIPsFromInitialCheck)
 		}
 	}
 
@@ -497,6 +517,116 @@ func (s *Server) returnCDNARecords(req *dns.Msg, cdnIPs []net.IP) *dns.Msg {
 	}
 
 	return newResp
+}
+
+// noAorAAAA 判断响应中是否缺少所有 A/AAAA 记录
+func (s *Server) noAorAAAA(resp *dns.Msg) bool {
+    if resp == nil {
+        return true
+    }
+    for _, ans := range resp.Answer {
+        switch ans.Header().Rrtype {
+        case dns.TypeA, dns.TypeAAAA:
+            return false
+        }
+    }
+    return true
+}
+
+// effectiveStrategyForNoRecord 计算在无 A/AAAA 时适用的策略与目标域名
+func (s *Server) effectiveStrategyForNoRecord(req *dns.Msg, originalResp *dns.Msg) (string, string) {
+    if len(req.Question) == 0 {
+        return config.StrategyNone, ""
+    }
+    qName := req.Question[0].Name
+    domain := normalizeDomain(qName)
+    strategy := s.config.GetDomainStrategy(domain)
+    if strategy == config.StrategyReturnCDNA {
+        return strategy, domain
+    }
+    if strategy == config.StrategyNone {
+        chain := NewCNAMEChain()
+        chain.BuildFromResponse(originalResp)
+        for d := range chain.domains {
+            if s.domainMatcher.Match(d) {
+                s2 := s.config.GetDomainStrategy(d)
+                if s2 == config.StrategyReturnCDNA {
+                    return s2, d
+                }
+            }
+        }
+    }
+    return strategy, domain
+}
+
+// shouldStripCNAMEWhenNoRecord 判断某域名对应规则是否启用无记录时剔除 CNAME
+func (s *Server) shouldStripCNAMEWhenNoRecord(domain string) bool {
+    d := strings.TrimSuffix(strings.ToLower(domain), ".")
+    for _, rule := range s.config.Domains {
+        if util.MatchDomain(rule.Pattern, d) {
+            return rule.StripCNAMEWhenNoRecord
+        }
+    }
+    return false
+}
+
+// stripCNAMEsForDomain 在响应中移除与目标域名及其 CNAME 链相关的 CNAME 记录
+func (s *Server) stripCNAMEsForDomain(resp *dns.Msg, domain string) *dns.Msg {
+    if resp == nil {
+        return resp
+    }
+    domain = normalizeDomain(domain)
+
+    // 构建 CNAME 链映射
+    cnameMap := make(map[string]string)
+    for _, ans := range resp.Answer {
+        if cname, ok := ans.(*dns.CNAME); ok {
+            source := normalizeDomain(cname.Hdr.Name)
+            target := normalizeDomain(cname.Target)
+            cnameMap[source] = target
+        }
+    }
+
+    // 收集需要剔除的域名集合：domain 及其链上所有目标
+    toStrip := make(map[string]bool)
+    current := domain
+    for {
+        toStrip[current] = true
+        next, ok := cnameMap[current]
+        if !ok || next == current {
+            break
+        }
+        current = next
+    }
+
+    // 生成新的响应，过滤掉匹配域名集合的 CNAME 记录
+    newResp := resp.Copy()
+    newAns := make([]dns.RR, 0, len(resp.Answer))
+    for _, rr := range resp.Answer {
+        if cname, ok := rr.(*dns.CNAME); ok {
+            src := normalizeDomain(cname.Hdr.Name)
+            if toStrip[src] {
+                continue
+            }
+        }
+        newAns = append(newAns, rr)
+    }
+    newResp.Answer = newAns
+    return newResp
+}
+
+// shouldNoRecordNoFallback 判断当前域名是否在“无 A/AAAA 时不回退”策略下生效
+func (s *Server) shouldNoRecordNoFallback(domain string) bool {
+    d := strings.TrimSuffix(strings.ToLower(domain), ".")
+    for _, rule := range s.config.Domains {
+        if util.MatchDomain(rule.Pattern, d) {
+            if rule.NoRecordNoFallback != nil {
+                return *rule.NoRecordNoFallback
+            }
+            break
+        }
+    }
+    return s.config.Upstream.NoRecordNoFallback
 }
 
 // checkCache 检查缓存

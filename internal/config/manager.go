@@ -263,18 +263,20 @@ func (m *ConfigManager) RemoveListener(listener ConfigChangeListener) {
 
 // notifyListeners 通知所有监听器配置已更改
 func (m *ConfigManager) notifyListeners(oldConfig, newConfig *Config) {
-	m.mu.RLock() // 修复：使用 m.mu 保护 listeners
-	defer m.mu.RUnlock()
-	// log.Printf("配置已更新，正在应用新配置...") // 考虑移除此处的日志，让每个 listener 自己决定如何记录
-	for _, listener := range m.listeners {
-		// 为了避免单个监听器 panic 影响其他监听器，可以考虑在此处使用 recover
-		go func(l ConfigChangeListener) { // 在单独的 goroutine 中通知，避免阻塞 ConfigManager
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("ConfigManager: 监听器 %T 在 OnConfigChange 中 panic: %v", l, r)
-				}
-			}()
-			l.OnConfigChange(oldConfig, newConfig)
-		}(listener)
-	}
+    m.mu.RLock() // 使用 m.mu 保护 listeners
+    listeners := make([]ConfigChangeListener, len(m.listeners))
+    copy(listeners, m.listeners)
+    m.mu.RUnlock()
+
+    // 同步逐个调用，满足测试对“监听器已被调用”的即时性预期
+    for _, l := range listeners {
+        func(l ConfigChangeListener) {
+            defer func() {
+                if r := recover(); r != nil {
+                    log.Printf("ConfigManager: 监听器 %T 在 OnConfigChange 中 panic: %v", l, r)
+                }
+            }()
+            l.OnConfigChange(oldConfig, newConfig)
+        }(l)
+    }
 }
